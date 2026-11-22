@@ -1,6 +1,7 @@
 from __future__ import annotations
 import asyncio
 import os
+import re
 import secrets
 import time
 from contextlib import asynccontextmanager
@@ -145,6 +146,22 @@ async def lifespan(app: FastAPI):
     yield
 
 app = FastAPI(title="Doudian Remote QR Login", lifespan=lifespan)
+JPEG_DATA_RE = re.compile(r"^data:image/jpeg;base64,[A-Za-z0-9+/=]+$")
+
+@app.middleware("http")
+async def security_headers(request: Request, call_next):
+    resp = await call_next(request)
+    resp.headers["X-Content-Type-Options"] = "nosniff"
+    resp.headers["X-Frame-Options"] = "DENY"
+    resp.headers["Referrer-Policy"] = "no-referrer"
+    resp.headers["Content-Security-Policy"] = (
+        "default-src 'self'; img-src 'self' data:; "
+        "style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; "
+        "connect-src 'self' ws: wss:; frame-ancestors 'none'; base-uri 'self'"
+    )
+    if request.url.scheme == "https" or request.headers.get("x-forwarded-proto") == "https":
+        resp.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+    return resp
 
 # ---------- static ----------
 @app.get("/health")
@@ -514,7 +531,7 @@ async def handle_agent_message(ws: WebSocket, login: auth.LoginSession, msg: dic
                 return   # 同一二维码，刷新未产生新码
 
             jpg = msg.get("jpg") or ""
-            if not jpg.startswith("data:image/jpeg;base64,") or len(jpg) > 200_000:
+            if not JPEG_DATA_RE.match(jpg) or len(jpg) > 200_000:
                 return
             s.qr_jpeg = jpg
             s.old_digest = msg.get("digest")

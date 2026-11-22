@@ -108,16 +108,32 @@ pub fn start_server() -> Result<PanelServer> {
                 let _ = req.respond(Response::from_string("forbidden").with_status_code(403));
                 continue;
             }
+            if method == Method::Post {
+                let ct_ok = req.headers().iter().find(|h| h.field.equiv("Content-Type"))
+                    .map(|h| h.value.as_str().to_ascii_lowercase().starts_with("application/json"))
+                    .unwrap_or(false);
+                if !ct_ok {
+                    let _ = req.respond(Response::from_string("unsupported media type").with_status_code(415));
+                    continue;
+                }
+                if let Some(h) = req.headers().iter().find(|h| h.field.equiv("Origin")) {
+                    let o = h.value.as_str();
+                    if o != "http://127.0.0.1:8765" && o != "http://localhost:8765" {
+                        let _ = req.respond(Response::from_string("forbidden origin").with_status_code(403));
+                        continue;
+                    }
+                }
+            }
             match (method, path.as_str()) {
                 (Method::Get, "/") | (Method::Get, "/login") => {
-                    let _ = req.respond(Response::from_string(login_html()).with_header(Header::from_bytes("Content-Type", "text/html; charset=utf-8").unwrap()));
+                    let _ = req.respond(Response::from_string(login_html()).with_header(Header::from_bytes("Content-Type", "text/html; charset=utf-8").unwrap()).with_header(Header::from_bytes("X-Frame-Options", "DENY").unwrap()).with_header(Header::from_bytes("Cache-Control", "no-store").unwrap()));
                 }
                 (Method::Get, "/app") => {
                     let logged = !state.lock().unwrap().cookie.is_empty();
                     if !logged {
                         let _ = req.respond(Response::empty(302).with_header(Header::from_bytes("Location", "/login").unwrap()));
                     } else {
-                        let _ = req.respond(Response::from_string(app_html()).with_header(Header::from_bytes("Content-Type", "text/html; charset=utf-8").unwrap()));
+                        let _ = req.respond(Response::from_string(app_html()).with_header(Header::from_bytes("Content-Type", "text/html; charset=utf-8").unwrap()).with_header(Header::from_bytes("X-Frame-Options", "DENY").unwrap()).with_header(Header::from_bytes("Cache-Control", "no-store").unwrap()));
                     }
                 }
                 (Method::Get, "/api/status") => {

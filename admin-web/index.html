@@ -1,0 +1,40 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>系统管理 · 抖店扫码助手</title><link rel="stylesheet" href="/admin/static/style.css"></head>
+<body><div class="shell"><div class="top"><div class="brand"><div class="logo">管</div><div><h1>系统管理</h1><p>账号 / 在线坐席 / 当前会话</p></div></div><button class="btn btn-ghost" onclick="logout()">退出登录</button></div>
+<div class="tabs"><button class="tab active" data-tab="accounts">账号管理</button><button class="tab" data-tab="seats">在线坐席</button><button class="tab" data-tab="sessions">当前会话</button></div>
+<div class="card panel" id="panel">加载中…</div></div><div id="toast" class="toast"></div>
+<script>
+let tab='accounts';const $=s=>document.querySelector(s);
+function esc(t){return String(t??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
+function toast(t){const x=$('#toast');x.textContent=t;x.classList.add('show');clearTimeout(x._t);x._t=setTimeout(()=>x.classList.remove('show'),2600)}
+async function api(u,o){
+  const r=await fetch(u,o||{});
+  if(r.status===401){location.href='/admin?expired=1';throw new Error('登录已失效')}
+  let j={};try{j=await r.json()}catch(e){}
+  if(r.status===403&&j.detail==='must_change_password'){location.href='/admin';throw new Error('请先修改初始密码')}
+  if(!r.ok)throw new Error(j.detail||('HTTP '+r.status));
+  return j;
+}
+document.querySelectorAll('.tab').forEach(b=>b.onclick=()=>{tab=b.dataset.tab;document.querySelectorAll('.tab').forEach(x=>x.classList.toggle('active',x===b));load()});
+function roleText(r){return {admin:'管理员',seat:'坐席端统一账号',scanner:'扫码端统一账号'}[r]||r}
+function stateText(s){return {WAIT_QR:'等待二维码',VALID:'有效',REFRESHING:'自动刷新中',SCANNED:'已扫码待确认'}[s]||s}
+async function load(){
+  const p=$('#panel');
+  try{
+    if(tab==='accounts'){
+      const j=await api('/admin/accounts');
+      p.innerHTML='<h3>账号管理</h3><table><thead><tr><th>账号</th><th>角色</th><th>初始密码</th><th>操作</th></tr></thead><tbody>'+j.items.map(a=>`<tr><td>${esc(a.username)}</td><td>${esc(roleText(a.role))}</td><td>${a.must_change_password?'待修改':'已修改'}</td><td><button class="btn btn-ghost" onclick="setPwd('${esc(a.username)}')">修改密码</button></td></tr>`).join('')+'</tbody></table><p class="muted" style="margin-top:12px">修改后该账号所有登录端立即失效。</p>';
+    }else if(tab==='seats'){
+      const j=await api('/admin/seats');
+      p.innerHTML='<h3>在线坐席</h3><table><thead><tr><th>坐席名称</th><th>状态</th><th>当前会话</th><th>操作</th></tr></thead><tbody>'+j.items.map(s=>`<tr><td>${esc(s.seat_name)}</td><td>${s.online?'<span class="badge">● 在线</span>':'<span class="badge off">○ 离线</span>'}</td><td>${esc(s.current_session_id||'—')}</td><td><button class="btn btn-danger" onclick="kick('${esc(s.seat_id)}')">强制下线</button> <button class="btn btn-ghost" onclick="delSeat('${esc(s.seat_id)}')">删除绑定</button></td></tr>`).join('')+'</tbody></table>';
+    }else{
+      const j=await api('/admin/sessions');
+      p.innerHTML='<h3>当前进行中的会话</h3><table><thead><tr><th>会话</th><th>店铺</th><th>坐席</th><th>状态</th></tr></thead><tbody>'+j.items.map(s=>`<tr><td>${esc(String(s.session_id).slice(0,8))}</td><td>${esc(s.shop_name)}</td><td>${esc(s.seat_name)}</td><td>${esc(stateText(s.state))}</td></tr>`).join('')+'</tbody></table>';
+    }
+  }catch(e){ if(e.message!=='登录已失效'){p.innerHTML='<div class="empty">加载失败：'+esc(e.message)+'</div>';} }
+}
+window.setPwd=async u=>{const p=prompt('输入 '+u+' 的新密码（至少10位，含字母和数字）');if(!p)return;if(p.length<10||!/[A-Za-z]/.test(p)||!/[0-9]/.test(p)){toast('密码至少10位且需包含字母和数字');return}const p2=prompt('再次输入新密码');if(p2!==p){toast('两次输入不一致');return}try{await api(`/admin/accounts/${encodeURIComponent(u)}/password`,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({new_password:p})});toast('已修改，相关登录端已失效');await load()}catch(e){toast('修改失败：'+e.message)}};
+window.delSeat=async id=>{if(!confirm('删除该坐席绑定？删除后旧设备需重新登录'))return;try{await api(`/admin/seats/${encodeURIComponent(id)}`,{method:'DELETE'});toast('已删除绑定');await load()}catch(e){toast('删除失败：'+e.message)}};
+window.kick=async id=>{if(!confirm('强制下线该坐席？其进行中的会话会关闭'))return;try{await api(`/admin/seats/${encodeURIComponent(id)}/force-logout`,{method:'POST'});toast('已强制下线');await load()}catch(e){toast('操作失败：'+e.message)}};
+async function logout(){try{await fetch('/auth/logout',{method:'POST'})}catch(e){}location.href='/admin'}
+load();setInterval(load,5000);
+</script></body></html>

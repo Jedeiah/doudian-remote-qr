@@ -1,0 +1,15 @@
+[Unit]
+Description=Doudian Remote QR Login
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/doudian-remote-qr
+EnvironmentFile=/opt/doudian-remote-qr/.env
+ExecStart=/opt/doudian-remote-qr/.venv/bin/python -m uvicorn server.main:app --host 127.0.0.1 --port 8000 --workers 1
+Restart=always
+RestartSec=3
+User=www-data
+
+[Install]
+WantedBy=multi-user.target

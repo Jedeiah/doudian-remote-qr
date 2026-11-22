@@ -1,0 +1,102 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>扫码端 · 抖店扫码助手</title><link rel="stylesheet" href="/scan/static/style.css"></head>
+<body><div class="shell">
+<div class="app-head"><div class="brand"><div class="logo">码</div><div><h1>抖店扫码助手</h1><p>扫码端 · 实时待扫码列表</p></div></div>
+<div style="display:flex;gap:8px;align-items:center"><span class="pill scan">scanner</span><button class="btn btn-ghost" id="logout" style="height:44px">退出</button></div></div>
+<div class="layout" style="margin-top:20px">
+<aside class="card list-card"><div class="list-head"><h3>待扫码</h3><span class="count" id="count">0</span></div><div id="sessions" class="sessions"><div class="empty">暂时没有待扫码的会话<br>坐席发起登录后，这里会自动出现</div></div></aside>
+<section class="card detail" id="detail"><div class="empty" style="min-height:360px;display:grid;place-items:center">从左侧选择一条会话<br><span style="font-size:12px">即可查看实时二维码</span></div></section>
+</div></div><div id="toast" class="toast"></div>
+<script>
+let current=null, sessions=[], pollTimer=null, detailSeq=0, ws=null, wsRetry=0, actionBusy=false;
+const $=s=>document.querySelector(s);
+function toast(t){const x=$('#toast');x.textContent=t;x.classList.add('show');clearTimeout(x._t);x._t=setTimeout(()=>x.classList.remove('show'),2600)}
+function esc(t){return String(t??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
+async function api(url,opt){
+  const r=await fetch(url,opt||{});
+  if(r.status===401){location.href='/scan?expired=1';throw new Error('登录已失效')}
+  let j={}; try{j=await r.json()}catch(e){}
+  if(!r.ok) throw new Error(j.detail||('HTTP '+r.status));
+  return j;
+}
+const reasonText={no_qr:'未检出二维码',ttl:'超时已结束',auto_refresh_failed:'自动刷新失败，请让坐席重新发起',force_logout:'坐席已被强制下线',seat_deleted:'坐席已被删除',window_closed:'坐席窗口已关闭',reject:'已拒绝',seat_cancel:'坐席已取消',agent_offline:'坐席端已离线'};
+function stateText(s){return {WAIT_QR:'等待二维码',VALID:'有效',REFRESHING:'自动刷新中',SCANNED:'已扫码待确认',DONE:'已完成',CLOSED:'已结束'}[s]||s}
+function stateDesc(s){return {WAIT_QR:'正在等待坐席端检出二维码…',VALID:'',REFRESHING:'二维码正在自动刷新，请稍候…',SCANNED:'已扫码，等待坐席确认',DONE:'登录成功',CLOSED:'会话已结束'}[s]||''}
+function render(){
+  const box=$('#sessions');$('#count').textContent=sessions.length;
+  if(!sessions.length){box.innerHTML='<div class="empty">暂时没有待扫码的会话<br>坐席发起登录后，这里会自动出现</div>';return}
+  box.innerHTML=sessions.map(s=>`<div class="session ${current===s.session_id?'active':''}" data-id="${esc(s.session_id)}"><div class="row1"><span class="shop">${esc(s.shop_name)}</span><span class="state ${esc(s.state)}">${stateText(s.state)}</span></div><div class="meta">${esc(s.seat_name)} · ${new Date(s.created_at).toLocaleTimeString('zh-CN',{hour:'2-digit',minute:'2-digit'})}</div></div>`).join('');
+  box.querySelectorAll('.session').forEach(el=>el.onclick=()=>openSession(el.dataset.id));
+}
+async function openSession(id){
+  current=id; render(); if(ws&&ws.readyState===1)ws.send(JSON.stringify({type:'subscribe',session_id:id}));
+  await loadDetail();
+  const d=$('#detail'); if(window.innerWidth<860) d.scrollIntoView({block:'start',behavior:'smooth'});
+}
+async function loadDetail(){
+  const id=current; if(!id)return;
+  const seq=++detailSeq;
+  try{
+    const j=await api('/scan/sessions/'+encodeURIComponent(id));
+    if(seq!==detailSeq||current!==id)return;
+    renderDetail(j);
+  }catch(e){
+    if(seq!==detailSeq||current!==id)return;
+    if(String(e.message).includes('session_not_found')){
+      current=null;render();
+      $('#detail').innerHTML='<div class="empty" style="min-height:360px;display:grid;place-items:center">该会话已结束<br><span style="font-size:12px">请选择其它会话，或等待坐席重新发起</span></div>';
+    }else{toast(e.message)}
+  }
+}
+function renderDetail(j){
+  if(!j||!j.session_id)return;
+  const desc=stateDesc(j.state);
+  const qr=j.qr_jpeg?`<img src="${esc(j.qr_jpeg)}" alt="二维码">`:`<div class="qr-placeholder">${desc||'当前没有可显示的二维码'}</div>`;
+  const canScan=(j.state==='VALID');
+  $('#detail').innerHTML=`<div class="detail-head"><div><h2>${esc(j.shop_name)}</h2><div class="sub">${esc(j.seat_name)} · ${stateText(j.state)} · 第 ${Number(j.count)||0} 次刷新</div></div><span class="state ${esc(j.state)}">${stateText(j.state)}</span></div><div class="qrbox">${qr}</div><div class="actions">${canScan?'<button class="btn btn-soft" onclick="saveQR()">保存二维码</button>':''}${canScan?'<button class="btn btn-primary" onclick="markScanned()">我已扫码</button>':''}<button class="btn btn-danger" onclick="reject()">拒绝</button><button class="btn btn-ghost" onclick="back()">返回列表</button></div>`;
+}
+window.saveQR=()=>{const img=$('#detail img');if(!img)return;const a=document.createElement('a');a.href=img.src;a.download='douyin-qr.jpg';document.body.appendChild(a);a.click();a.remove();toast('已保存（iPhone 请长按图片保存）')};
+async function action(name){
+  if(!current||actionBusy)return;
+  actionBusy=true;
+  document.querySelectorAll('.actions button').forEach(b=>b.disabled=true);
+  try{
+    const j=await api('/scan/sessions/'+encodeURIComponent(current)+'/'+name,{method:'POST'});
+    toast(name==='scanned'?'已标记为已扫码，等待坐席确认':'已拒绝该会话');
+    await refreshAll();
+  }catch(e){
+    if(String(e.message).includes('state_not_scannable')){toast('当前状态不能标记扫码，请刷新页面');await refreshAll()}
+    else if(String(e.message).includes('already_closed')||String(e.message).includes('session_not_found')){toast('会话已结束');await refreshAll()}
+    else toast(e.message||'操作失败');
+  }finally{actionBusy=false;document.querySelectorAll('.actions button').forEach(b=>b.disabled=false)}
+}
+window.markScanned=()=>action('scanned');
+window.reject=async()=>{if(!current)return;await action('reject');current=null;render()};
+window.back=()=>{if(ws&&ws.readyState===1&&current)ws.send(JSON.stringify({type:'unsubscribe',session_id:current}));current=null;render();$('#detail').innerHTML='<div class="empty" style="min-height:360px;display:grid;place-items:center">从左侧选择一条会话<br><span style="font-size:12px">即可查看实时二维码</span></div>'};
+async function refreshAll(){
+  try{
+    const j=await api('/scan/sessions'); sessions=j.items||[]; render();
+    if(current) await loadDetail();
+  }catch(e){ if(e.message!=='登录已失效') toast(e.message) }
+}
+function connectWS(){
+  const proto=location.protocol==='https:'?'wss':'ws';
+  try{ws=new WebSocket(proto+'://'+location.host+'/ws/scan')}catch(e){return}
+  ws.onopen=()=>{wsRetry=0;if(current)ws.send(JSON.stringify({type:'subscribe',session_id:current}));refreshAll()};
+  ws.onmessage=e=>{let m={};try{m=JSON.parse(e.data)}catch(_){return}
+    if(m.type==='sessions'){sessions=m.items||[];render();if(current&&!sessions.some(x=>x.session_id===current)){current=null;render();$('#detail').innerHTML='<div class="empty" style="min-height:360px;display:grid;place-items:center">该会话已结束<br><span style="font-size:12px">请选择其它会话，或等待坐席重新发起</span></div>'}}
+    else if(m.type==='state'||m.type==='frame'||m.type==='session.snapshot'){if(current&&m.session_id===current)loadDetail()}
+    else if(m.type==='done'||m.type==='closed'){if(m.session_id===current){toast(m.type==='done'?'登录成功':(reasonText[m.reason]||'会话已结束'));current=null;render();$('#detail').innerHTML='<div class="empty" style="min-height:360px;display:grid;place-items:center">该会话已结束<br><span style="font-size:12px">请选择其它会话，或等待坐席重新发起</span></div>'}}
+  };
+  ws.onclose=()=>{ws=null;setTimeout(connectWS,Math.min(10000,1000*Math.pow(2,wsRetry++)))};
+}
+async function boot(){
+  try{
+    await api('/auth/me');
+    await refreshAll();
+    clearInterval(pollTimer); pollTimer=setInterval(refreshAll,5000);
+    connectWS();
+  }catch(e){ if(e.message!=='登录已失效'){ setTimeout(boot,2000) } }
+}
+$('#logout').onclick=async()=>{try{await fetch('/auth/logout',{method:'POST'})}catch(e){}location.href='/scan'};
+boot();
+</script></body></html>

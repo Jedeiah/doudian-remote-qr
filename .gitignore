@@ -1,0 +1,21 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+data/*.db
+data/*.db-*
+.pytest_cache/
+.DS_Store
+node_modules/
+dist/
+build/
+*.spec
+
+# JetBrains IDE
+.idea/
+*.iml
+
+# Rust build output
+agent-rs/target/
+target/

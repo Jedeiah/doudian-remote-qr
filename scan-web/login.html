@@ -1,0 +1,18 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>扫码端登录 · 抖店扫码助手</title><link rel="stylesheet" href="/scan/static/style.css"></head>
+<body><div class="login-wrap"><div class="card login-card">
+<div class="brand"><div class="logo">码</div><div><h1>抖店扫码助手</h1><p>扫码端 · 异地实时扫码</p></div></div>
+<h2 style="margin-top:24px">登录</h2><p class="sub">使用管理员分配的 scanner 账号登录</p>
+<div id="err" class="alert error"></div>
+<form id="form"><div class="field"><label>账号</label><input id="username" name="username" autocomplete="username" placeholder="scanner" required></div>
+<div class="field"><label>密码</label><input id="password" type="password" name="password" autocomplete="current-password" placeholder="••••••••" required></div>
+<button class="btn btn-primary w100" type="submit">登 录</button></form>
+<p style="font-size:12px;color:#94a3b8;text-align:center;margin-top:20px">登录后即可看到待扫码列表，无需接收任何链接</p>
+</div></div>
+<script>
+const err=document.getElementById('err'),form=document.getElementById('form');
+if(new URLSearchParams(location.search).get('expired')){err.textContent='登录已失效，请重新登录';err.className='alert error show'}
+form.addEventListener('submit',async e=>{e.preventDefault();err.className='alert error';err.textContent='';
+try{const r=await fetch('/auth/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:username.value.trim(),password:password.value,role:'scanner'})});
+const j=await r.json();if(!r.ok)throw new Error(j.detail||'登录失败');location.href='/scan/app';}
+catch(ex){err.textContent=ex.message;err.className='alert error show';}});
+</script></body></html>

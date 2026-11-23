@@ -152,8 +152,25 @@ fn run_worker_inner(operation_id: &str) -> Result<()> {
     let hwnd_arg = get("--hwnd").and_then(|s| s.parse::<isize>().ok());
     let fingerprint = format!("{}:rust", std::env::var("COMPUTERNAME").unwrap_or_else(|_| "pc".into()));
 
-    let (cookie, login) = if let Ok(c) = std::env::var("DRQ_COOKIE") {
+    // 只有面板显式传 --cookie-stdin 时才读 stdin：避免手动运行/旧面板场景下 read_line 永久阻塞。
+    // 读到 cookie 用完即弃；不再依赖进程环境变量，省去同机进程读取环境块泄露的风险。
+    let cookie_from_stdin = if args.iter().any(|a| a == "--cookie-stdin") {
+        use std::io::BufRead;
+        let mut line = String::new();
+        let _ = std::io::stdin().lock().read_line(&mut line);
+        let c = line.trim().to_string();
+        if c.is_empty() { None } else { Some(c) }
+    } else {
+        None
+    };
+    // 兼容旧路径：未走 stdin 时仍接受环境变量 cookie（旧面板配新 worker），否则账号密码登录
+    let env_cookie = std::env::var("DRQ_COOKIE").ok().filter(|c| !c.is_empty());
+    let cookie_value = cookie_from_stdin.or(env_cookie);
+    let (cookie, login) = if let Some(c) = cookie_value {
         let (_h, me) = http_json("GET", &format!("{server}/auth/me"), &c, None)?;
+        if me.get("detail").is_some() && me.get("username").is_none() {
+            return Err(anyhow!("auth/me 失败: {me}"));
+        }
         (c, me)
     } else {
         http_json("POST", &format!("{server}/auth/login"), "", Some(json!({
@@ -188,7 +205,8 @@ fn run_worker_inner(operation_id: &str) -> Result<()> {
         return Err(anyhow!("capture: no first frame"));
     }
     let (_c, sess) = http_json("POST", &format!("{server}/sessions"), &cookie, Some(json!({
-        "shop_name": shop, "window_key": format!("{pid}:{hwnd}"), "hwnd": hwnd, "pid": pid
+        "shop_name": shop, "window_key": format!("{pid}:{hwnd}"), "hwnd": hwnd, "pid": pid,
+        "operation_id": operation_id
     })))?;
     let sid = sess["session_id"].as_str().unwrap_or("").to_string();
     let mut attempt = sess["attempt_id"].as_str().unwrap_or("").to_string();

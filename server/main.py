@@ -109,8 +109,11 @@ async def refresh_timeout(sid: str, attempt_id: str):
     if s.retry_failed == 0:
         # retry once per refresh attempt
         s.attempt_id = state.new_id(); s.click_acked = False; s.refresh_count += 1; s.retry_failed = 1
-        await hub.send_to_agent(s.seat_id, {"type": "cmd.refresh", "session_id": s.id, "request_id": state.new_id(),
-                                            "attempt_id": s.attempt_id, "btn_full": s.last_btn_full, "btn_geom": s.btn_geom})
+        ok = await hub.send_to_agent(s.seat_id, {"type": "cmd.refresh", "session_id": s.id, "request_id": state.new_id(),
+                                                 "attempt_id": s.attempt_id, "btn_full": s.last_btn_full, "btn_geom": s.btn_geom})
+        if not ok:
+            await close_session(s, "agent_offline")
+            return
         await broadcast_state(s)
         _schedule(s.id, "refresh", 15, refresh_timeout, s.id, s.attempt_id)
     else:
@@ -299,14 +302,14 @@ async def admin_set_password(username: str, body: PasswordBody, _: auth.LoginSes
         raise HTTPException(400, "密码至少10位且需包含字母和数字")
     if not accounts.set_password(username, body.new_password, must_change=False):
         raise HTTPException(404, "account_not_found")
-    sids = auth.revoke_user(username)
-    await hub.close_sids(sids)
     acc = accounts.get_account(username)
     if acc and acc["role"] == "seat":
         for row in accounts.list_seats():
             if row["account_id"] == acc["id"]:
                 for s in list(state.active_for_seat(row["seat_id"])):
                     await close_session(s, "force_logout")
+    sids = auth.revoke_user(username)
+    await hub.close_sids(sids)
     return {"ok": True}
 
 @app.get("/admin/seats")
@@ -320,12 +323,13 @@ async def admin_seats(_: auth.LoginSession = Depends(admin_dep)):
 
 @app.post("/admin/seats/{seat_id}/force-logout")
 async def admin_force_logout(seat_id: str, _: auth.LoginSession = Depends(admin_dep)):
-    sids = auth.revoke_seat(seat_id)
-    await hub.close_sids(sids)
+    # 先关会话并下发指令（socket 仍在线），最后才撤销登录并断开 socket，确保消息送达
+    await hub.send_to_agent(seat_id, {"type": "force.logout", "seat_id": seat_id, "reason": "admin"})
     for s in list(state.all_sessions()):
         if s.seat_id == seat_id and not s.is_terminal:
             await close_session(s, "force_logout")
-    await hub.send_to_agent(seat_id, {"type": "force.logout", "seat_id": seat_id, "reason": "admin"})
+    sids = auth.revoke_seat(seat_id)
+    await hub.close_sids(sids)
     return {"ok": True}
 
 @app.get("/admin/sessions")
@@ -335,11 +339,11 @@ async def admin_sessions(_: auth.LoginSession = Depends(admin_dep)):
 
 @app.delete("/admin/seats/{seat_id}")
 async def admin_delete_seat(seat_id: str, _: auth.LoginSession = Depends(admin_dep)):
-    sids = auth.revoke_seat(seat_id)
-    await hub.close_sids(sids)
     for s in list(state.all_sessions()):
         if s.seat_id == seat_id and not s.is_terminal:
             await close_session(s, "seat_deleted")
+    sids = auth.revoke_seat(seat_id)
+    await hub.close_sids(sids)
     accounts.delete_seat(seat_id)
     return {"ok": True}
 
@@ -434,7 +438,7 @@ async def current_session(request: Request):
     login = seat_dep(request)
     active = state.active_for_seat(login.seat_id)
     return {"sessions": [{"session_id": x.id, "shop_name": x.shop_name, "state": x.state,
-                          "count": x.refresh_count,
+                          "count": x.refresh_count, "operation_id": x.operation_id,
                           "qr_jpeg": x.qr_jpeg if x.state == "VALID" else None} for x in active]}
 
 @app.get("/sessions/{sid}")

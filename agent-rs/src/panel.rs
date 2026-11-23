@@ -1,5 +1,6 @@
 use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
@@ -7,15 +8,24 @@ use tiny_http::{Header, Method, Response, Server};
 
 pub struct PanelServer;
 
+// 单次操作的全部状态收口到一把锁：id/phase/session/error/deadline 一起读写，
+// 杜绝 check-then-write 被其他线程插入导致的状态覆盖。
+#[derive(Clone, Default)]
+struct Op {
+    id: String,
+    phase: String,          // "" / starting / running / failed
+    session_id: Option<String>,
+    error: String,
+    deadline: Option<std::time::Instant>,
+}
+
 #[derive(Clone, Default)]
 struct State {
     cookie: String,
     server: String,
-    children: Arc<Mutex<Vec<std::process::Child>>>,
-    starting_until: Arc<Mutex<Option<std::time::Instant>>>,
-    start_error: Arc<Mutex<String>>,
-    op_phase: Arc<Mutex<String>>,
-    op_session: Arc<Mutex<Option<String>>>,
+    op: Arc<Mutex<Op>>,
+    // op_id -> worker 子进程；便于超时精确 kill，避免误杀其他 operation
+    children: Arc<Mutex<HashMap<String, std::process::Child>>>,
 }
 
 const CSS: &str = r#"<style>
@@ -96,6 +106,16 @@ fn http(method: &str, url: &str, cookie: &str, body: Option<Value>) -> Result<(S
 pub fn start_server() -> Result<PanelServer> {
     let server = Arc::new(Server::http("127.0.0.1:8765").map_err(|e| anyhow!("{e}"))?);
     let state = Arc::new(Mutex::new(State::default()));
+
+    // 后台回收已退出的 worker 子进程，避免内核进程对象/句柄随多次登录累积泄漏
+    {
+        let children = state.lock().unwrap().children.clone();
+        std::thread::spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_secs(3));
+            let mut guard = children.lock().unwrap();
+            guard.retain(|_, c| !matches!(c.try_wait(), Ok(Some(_)) | Err(_)));
+        });
+    }
     let srv = server.clone();
     std::thread::spawn(move || {
         for mut req in srv.incoming_requests() {
@@ -139,23 +159,81 @@ pub fn start_server() -> Result<PanelServer> {
                 (Method::Get, "/api/status") => {
                     let st = state.lock().unwrap().clone();
                     if st.cookie.is_empty() { respond_json(req, 200, json!({"logged_in": false, "sessions": []})); continue; }
+                    // HTTP 前记录 op.id：has 是网络快照，只有与 op.id 同代才可用，
+                    // 否则（请求期间 op 被换成新的）整轮丢弃 has 判定，避免旧快照套新 op。
+                    let observed_op_id = st.op.lock().unwrap().id.clone();
                     match http("GET", &format!("{}/sessions/current", st.server), &st.cookie, None) {
                         Ok((_, v)) => {
-                            let has = v["sessions"].as_array().map(|a| !a.is_empty()).unwrap_or(false);
-                            let mut phase = st.op_phase.lock().unwrap().clone();
-                            if phase == "starting" && st.starting_until.lock().unwrap().map(|t| t <= std::time::Instant::now()).unwrap_or(true) {
-                                phase = "failed".to_string();
-                                *st.op_phase.lock().unwrap() = phase.clone();
-                                *st.start_error.lock().unwrap() = "启动超时，请查看 agent.log".to_string();
-                            }
-                            if phase == "running" && !has {
-                                *st.op_phase.lock().unwrap() = String::new();
-                                *st.op_session.lock().unwrap() = None;
-                                phase = String::new();
+                            // 在 op 单锁内完成判定与状态改写；需要 kill 的 child 先移出，锁外再 wait
+                            let mut child_to_kill: Option<std::process::Child> = None;
+                            let mut timed_out_op_id: Option<String> = None;
+                            let (phase, start_error, session_id) = {
+                                let mut op = st.op.lock().unwrap();
+                                if op.id != observed_op_id {
+                                    // 请求期间 op 已变化，has 快照过期，本轮不做任何基于 has 的状态改写
+                                    (op.phase.clone(), op.error.clone(), op.session_id.clone())
+                                } else {
+                                // 只认 operation_id 等于当前 op 的会话：别人的会话不能把本 op 标成 running，
+                                // 也不能用通用 has 阻止本 op 超时。必须在 op 锁内、用当前 op.id 计算。
+                                let cur_op_id = op.id.clone();
+                                let has_current = v["sessions"].as_array().map(|items| {
+                                    items.iter().any(|s| s["operation_id"].as_str() == Some(cur_op_id.as_str()))
+                                }).unwrap_or(false);
+                                if op.phase == "starting" && !has_current && op.deadline.map(|t| t <= std::time::Instant::now()).unwrap_or(true) {
+                                    let op_id = op.id.clone();
+                                    timed_out_op_id = Some(op_id.clone());
+                                    child_to_kill = st.children.lock().unwrap().remove(&op_id);
+                                    op.id = String::new();
+                                    op.deadline = None;
+                                    op.phase = "failed".to_string();
+                                    op.error = "启动超时，请查看 agent.log".to_string();
+                                }
+                                // 服务端已有本 op 的会话但 stdout 的 session.created 尚未被 reader 消费时，
+                                // 靠 HTTP /sessions/current 把 starting 纠正为 running，避免面板一直显示“启动中”
+                                if op.phase == "starting" && has_current {
+                                    op.phase = "running".to_string();
+                                    op.deadline = None;
+                                    if op.session_id.is_none() {
+                                        if let Some(mine) = v["sessions"].as_array().and_then(|items| {
+                                            items.iter().find(|s| s["operation_id"].as_str() == Some(cur_op_id.as_str()))
+                                        }) {
+                                            op.session_id = mine["session_id"].as_str().map(str::to_string);
+                                        }
+                                    }
+                                }
+                                if op.phase == "running" && !has_current {
+                                    let op_id = op.id.clone();
+                                    child_to_kill = st.children.lock().unwrap().remove(&op_id);
+                                    *op = Op::default();
+                                }
+                                    (op.phase.clone(), op.error.clone(), op.session_id.clone())
+                                }
+                            };
+                            if let Some(mut c) = child_to_kill { let _ = c.kill(); let _ = c.wait(); }
+                            if let Some(old_op_id) = timed_out_op_id {
+                                // 只取消 operation_id 等于旧 op 的会话：清掉旧 worker 的孤儿，
+                                // 不碰新 op 的会话。按 op_id 过滤把误清新会话的窗口关掉；
+                                // 但仍非绝对零孤儿——旧 worker 若在 GET 后 cancel 前又建会话可能漏。
+                                let server = st.server.clone();
+                                let cookie = st.cookie.clone();
+                                std::thread::spawn(move || {
+                                    std::thread::sleep(std::time::Duration::from_millis(300));
+                                    if let Ok((_, v)) = http("GET", &format!("{}/sessions/current", server), &cookie, None) {
+                                        if let Some(items) = v["sessions"].as_array() {
+                                            for s in items {
+                                                if s["operation_id"].as_str() == Some(old_op_id.as_str()) {
+                                                    if let Some(sid) = s["session_id"].as_str() {
+                                                        let _ = http("POST", &format!("{}/sessions/{}/cancel", server, sid), &cookie, None);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                });
                             }
                             let starting = phase == "starting";
                             respond_json(req, 200, json!({"logged_in": true, "sessions": v["sessions"], "starting": starting,
-                                "start_error": st.start_error.lock().unwrap().clone(), "operation": {"phase": phase, "session_id": st.op_session.lock().unwrap().clone()}}))
+                                "start_error": start_error, "operation": {"phase": phase, "session_id": session_id}}))
                         },
                         Err(e) if e.to_string().starts_with("401") => respond_json(req, 200, json!({"logged_in": false, "sessions": []})),
                         Err(e) => respond_json(req, 200, json!({"logged_in": true, "sessions": [], "error": e.to_string()})),
@@ -180,7 +258,9 @@ pub fn start_server() -> Result<PanelServer> {
                     let st = state.lock().unwrap().clone();
                     if st.cookie.is_empty() { respond_json(req, 400, json!({"detail":"请先登录"})); continue; }
                     if b["shop"].as_str().unwrap_or("").trim().is_empty() { respond_json(req, 400, json!({"detail":"请输入店铺名称"})); continue; }
-                    if *st.op_phase.lock().unwrap() == "starting" { respond_json(req, 409, json!({"detail":"正在发起中，请稍候"})); continue; }
+                    let cur_phase = st.op.lock().unwrap().phase.clone();
+                    if cur_phase == "starting" { respond_json(req, 409, json!({"detail":"正在发起中，请稍候"})); continue; }
+                    if cur_phase == "running" { respond_json(req, 409, json!({"detail":"已有进行中的会话，请先完成或取消"})); continue; }
                     let hwnd: isize = match b["hwnd"].as_str().and_then(|h| h.trim().parse::<isize>().ok()) {
                         Some(h) => h,
                         None => match crate::win::find_window() {
@@ -201,67 +281,109 @@ pub fn start_server() -> Result<PanelServer> {
                     cmd.arg("worker").arg("--server").arg(&st.server).arg("--username").arg("seat").arg("--password").arg("").arg("--seat-name").arg("").arg("--shop").arg(b["shop"].as_str().unwrap_or(""));
                     cmd.arg("--hwnd").arg(hwnd.to_string());
                     cmd.arg("--operation-id").arg(&operation_id);
-                    cmd.env("DRQ_COOKIE", &st.cookie).env("DRQ_SERVER", &st.server);
-                    *st.starting_until.lock().unwrap() = Some(std::time::Instant::now() + std::time::Duration::from_secs(20));
-                    *st.start_error.lock().unwrap() = String::new();
-                    *st.op_phase.lock().unwrap() = "starting".to_string();
-                    *st.op_session.lock().unwrap() = None;
+                    // 显式开关：只有面板启动的 worker 才从 stdin 读 cookie，手动运行不会阻塞
+                    cmd.arg("--cookie-stdin");
+                    cmd.stdin(Stdio::piped());
+                    // 单锁写入新 op 状态
+                    {
+                        let mut op = st.op.lock().unwrap();
+                        op.id = operation_id.clone();
+                        op.phase = "starting".to_string();
+                        op.session_id = None;
+                        op.error = String::new();
+                        op.deadline = Some(std::time::Instant::now() + std::time::Duration::from_secs(20));
+                    }
                     let server = st.server.clone();
                     let cookie = st.cookie.clone();
-                    let starting = st.starting_until.clone();
-                    let start_error = st.start_error.clone();
-                    let children = st.children.clone();
                     cmd.stdout(Stdio::piped());
                     cmd.stderr(Stdio::null());
                     let op_id_thread = operation_id.clone();
-                    let phase = st.op_phase.clone();
-                    let op_session = st.op_session.clone();
-                    let start_error = st.start_error.clone();
-                    let starting_until = st.starting_until.clone();
+                    let op = st.op.clone();
                     let children = st.children.clone();
                     std::thread::spawn(move || {
                         if let Ok((_, v)) = http("GET", &format!("{}/sessions/current", server), &cookie, None) {
                             if v["sessions"].as_array().map(|a| !a.is_empty()).unwrap_or(false) {
-                                *start_error.lock().unwrap() = "本坐席已有进行中的会话，请在列表中处理或取消后再发起".to_string();
-                                *phase.lock().unwrap() = "failed".to_string();
-                                *starting_until.lock().unwrap() = None;
+                                let mut g = op.lock().unwrap();
+                                if g.id == op_id_thread {
+                                    g.error = "本坐席已有进行中的会话，请在列表中处理或取消后再发起".to_string();
+                                    g.phase = "failed".to_string();
+                                    g.deadline = None;
+                                    g.id = String::new();
+                                }
                                 return;
                             }
                         }
+                        // spawn 前二次校验：若本 op 已被超时/confirm/cancel/logout 撤销，不再启动
+                        {
+                            let g = op.lock().unwrap();
+                            if g.id != op_id_thread || g.phase != "starting" { return; }
+                        }
                         match cmd.spawn() {
                             Ok(mut child) => {
+                                // 先不写 cookie：worker 会阻塞在 stdin，确保“注册 child + op 校验”先完成
+                                let stdin = child.stdin.take();
                                 let stdout = child.stdout.take();
-                                children.lock().unwrap().push(child);
-                                let phase2 = phase.clone();
-                                let session2 = op_session.clone();
-                                let error2 = start_error.clone();
-                                let deadline2 = starting_until.clone();
+                                {
+                                    let g = op.lock().unwrap();
+                                    if g.id != op_id_thread || g.phase != "starting" {
+                                        drop(g);
+                                        let _ = child.kill();
+                                        let _ = child.wait();
+                                        return;
+                                    }
+                                    children.lock().unwrap().insert(op_id_thread.clone(), child);
+                                }
+                                // 注册完成后才下发 cookie；若超时先发生，child 已被 kill，不会建会话
+                                if let Some(mut stdin) = stdin {
+                                    use std::io::Write;
+                                    let _ = writeln!(stdin, "{}", cookie);
+                                }
+                                let op2 = op.clone();
                                 std::thread::spawn(move || {
+                                    let mut saw_event = false;
                                     if let Some(out) = stdout {
                                         for line in BufReader::new(out).lines().flatten() {
                                             let v: Value = match serde_json::from_str(&line) { Ok(v) => v, Err(_) => continue };
                                             if v["operation_id"].as_str().unwrap_or("") != op_id_thread { continue; }
+                                            // id 校验 + 状态写入在同一把 op 锁内完成，不可被其他线程插入
+                                            let mut g = op2.lock().unwrap();
+                                            if g.id != op_id_thread { break; }
                                             match v["type"].as_str().unwrap_or("") {
                                                 "session.created" => {
-                                                    *session2.lock().unwrap() = v["session_id"].as_str().map(str::to_string);
-                                                    *phase2.lock().unwrap() = "running".to_string();
-                                                    *deadline2.lock().unwrap() = None;
+                                                    saw_event = true;
+                                                    g.session_id = v["session_id"].as_str().map(str::to_string);
+                                                    g.phase = "running".to_string();
+                                                    g.deadline = None;
                                                 }
                                                 "session.failed" => {
-                                                    *error2.lock().unwrap() = v["detail"].as_str().unwrap_or("坐席端启动失败").to_string();
-                                                    *phase2.lock().unwrap() = "failed".to_string();
-                                                    *deadline2.lock().unwrap() = None;
+                                                    saw_event = true;
+                                                    g.error = v["detail"].as_str().unwrap_or("坐席端启动失败").to_string();
+                                                    g.phase = "failed".to_string();
+                                                    g.deadline = None;
                                                 }
                                                 _ => {}
                                             }
                                         }
                                     }
+                                    // stdout EOF：worker 在创建会话前就退出/崩溃且没有发任何事件时，
+                                    // 立即置 failed。同样在 op 单锁内判定，仅当前 op 且仍 starting 才处理。
+                                    if !saw_event {
+                                        let mut g = op2.lock().unwrap();
+                                        if g.id == op_id_thread && g.phase == "starting" {
+                                            g.error = "worker 在创建会话前退出，请查看 agent.log".to_string();
+                                            g.phase = "failed".to_string();
+                                            g.deadline = None;
+                                        }
+                                    }
                                 });
                             }
                             Err(e) => {
-                                *start_error.lock().unwrap() = format!("启动坐席端失败：{e}");
-                                *phase.lock().unwrap() = "failed".to_string();
-                                *starting_until.lock().unwrap() = None;
+                                let mut g = op.lock().unwrap();
+                                if g.id == op_id_thread {
+                                    g.error = format!("启动坐席端失败：{e}");
+                                    g.phase = "failed".to_string();
+                                    g.deadline = None;
+                                }
                             }
                         }
                     });
@@ -274,9 +396,13 @@ pub fn start_server() -> Result<PanelServer> {
                     let action = if path.ends_with("confirm") { "confirm" } else { "cancel" };
                     match http("POST", &format!("{}/sessions/{}/{}", st.server, sid, action), &st.cookie, None) {
                         Ok(_) => {
-                            *st.op_phase.lock().unwrap() = String::new();
-                            *st.op_session.lock().unwrap() = None;
-                            *st.start_error.lock().unwrap() = String::new();
+                            // 清 op 并移出对应 child（锁外 kill/wait），防止旧 reader 复活已结束的会话
+                            let mut g = st.op.lock().unwrap();
+                            let op_id = g.id.clone();
+                            *g = Op::default();
+                            drop(g);
+                            let child = st.children.lock().unwrap().remove(&op_id);
+                            if let Some(mut c) = child { let _ = c.kill(); let _ = c.wait(); }
                             respond_json(req, 200, json!({"ok": true}))
                         },
                         Err(e) => respond_json(req, 400, json!({"detail": e.to_string()})),
@@ -285,7 +411,10 @@ pub fn start_server() -> Result<PanelServer> {
                 (Method::Post, "/api/logout") => {
                     let st = state.lock().unwrap().clone();
                     let _ = http("POST", &format!("{}/auth/logout", st.server), &st.cookie, None);
-                    for mut c in st.children.lock().unwrap().drain(..) { let _ = c.kill(); }
+                    // 先让当前 op 失效，阻止启动线程在 drain 之后插入 child；再 drain/kill
+                    *st.op.lock().unwrap() = Op::default();
+                    let kids: Vec<std::process::Child> = st.children.lock().unwrap().drain().map(|(_, c)| c).collect();
+                    for mut c in kids { let _ = c.kill(); let _ = c.wait(); }
                     state.lock().unwrap().cookie.clear();
                     respond_json(req, 200, json!({"ok": true}));
                 }
